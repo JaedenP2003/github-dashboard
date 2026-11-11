@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitHub Projects Dashboard</title>
+<style>
+  :root { --bg:#0f1419; --panel:#182028; --line:#27323d; --text:#e6edf3; --dim:#8b98a5; --accent:#58a6ff; --good:#3fb950; --warn:#d29922; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 system-ui,Segoe UI,sans-serif; padding:24px 16px; }
+  .wrap { max-width:1200px; margin:0 auto; }
+  h1 { margin:0 0 16px; font-size:22px; }
+  input, select { background:var(--panel); border:1px solid var(--line); color:var(--text); padding:8px 10px; border-radius:6px; min-width:0; font:inherit; }
+  button { background:var(--accent); color:#0b1220; border:0; padding:8px 14px; border-radius:6px; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:wait; }
+  a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+  small, .dim { color:var(--dim); }
+
+  /* Dropdown card for account entry */
+  details.settings { background:var(--panel); border:1px solid var(--line); border-radius:10px; margin-bottom:14px; }
+  details.settings summary { cursor:pointer; padding:10px 14px; font-weight:600; list-style:none; display:flex; justify-content:space-between; align-items:center; }
+  details.settings summary::-webkit-details-marker { display:none; }
+  details.settings summary::after { content:"▾"; color:var(--dim); transition:transform .15s; }
+  details.settings[open] summary::after { transform:rotate(180deg); }
+  .settings-body { padding:4px 14px 14px; display:flex; flex-direction:column; gap:10px; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; }
+  .row input { flex:1 1 220px; }
+
+  .toolbar { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:8px; }
+  .toolbar input { flex:1 1 220px; }
+  .status { color:var(--dim); margin:4px 0 14px; min-height:20px; }
+  .status.err { color:#f85149; }
+
+  /* Repo cards */
+  .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:14px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; display:flex; flex-direction:column; gap:10px; }
+  .card header { display:flex; justify-content:space-between; align-items:flex-start; gap:8px; }
+  .card .name { font-size:16px; font-weight:600; word-break:break-word; }
+  .card .desc { margin:0; color:var(--dim); }
+  .badge { display:inline-block; padding:1px 8px; border-radius:99px; font-size:12px; border:1px solid var(--line); white-space:nowrap; }
+  .public { color:var(--good); border-color:var(--good); }
+  .private { color:var(--warn); border-color:var(--warn); }
+  .meta { display:grid; grid-template-columns:auto 1fr; gap:4px 12px; margin:0; }
+  .meta dt { color:var(--dim); }
+  .meta dd { margin:0; min-width:0; }
+  .msg { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .card footer { margin-top:auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>GitHub Projects Dashboard</h1>
+
+  <details class="settings" id="settings">
+    <summary>Account settings</summary>
+    <div class="settings-body">
+      <div class="row">
+        <input id="user" placeholder="GitHub username">
+        <input id="token" type="password" placeholder="Token (optional, needed for private repos)">
+        <button id="go">Load</button>
+      </div>
+      <small>The token is stored only in this browser's localStorage and is sent only to api.github.com. Without one you get public repos and 60 API calls/hour.</small>
+    </div>
+  </details>
+
+  <div class="toolbar">
+    <input id="filter" placeholder="Filter by name / language / description">
+    <select id="sort">
+      <option value="pushed">Sort: Last push</option>
+      <option value="commit">Sort: Latest commit</option>
+      <option value="count">Sort: Commit count</option>
+      <option value="name">Sort: Name</option>
+      <option value="lang">Sort: Language</option>
+    </select>
+  </div>
+  <div id="status" class="status"></div>
+  <div id="grid" class="grid"></div>
+</div>
+
+<script>
+const API = "https://api.github.com";
+let rows = [];
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+const store = {
+  get(k){ try { return localStorage.getItem(k) || ""; } catch { return ""; } },
+  set(k,v){ try { localStorage.setItem(k,v); } catch {} },
+};
+
+function headers() {
+  const h = { Accept:"application/vnd.github+json" };
+  const t = $("token").value.trim();
+  if (t) h.Authorization = "Bearer " + t;
+  return h;
+}
+
+async function gh(url) {
+  const res = await fetch(url, { headers: headers() });
+  if (res.status === 403 && res.headers.get("x-ratelimit-remaining") === "0") {
+    const reset = new Date(res.headers.get("x-ratelimit-reset") * 1000).toLocaleTimeString();
+    throw new Error("Rate limit hit. Resets at " + reset + ". Add a token for 5,000/hour.");
+  }
+  return res;
+}
+
+// All repos for the user. With a token, /user/repos includes private ones.
+async function listRepos(user) {
+  const authed = !!$("token").value.trim();
+  const base = authed ? `${API}/user/repos?affiliation=owner&sort=pushed` : `${API}/users/${encodeURIComponent(user)}/repos?sort=pushed`;
+  let all = [];
+  for (let page = 1; page <= 5; page++) {
+    const res = await gh(`${base}&per_page=100&page=${page}`);
+    if (!res.ok) throw new Error(res.status === 404 ? "User not found" : res.status === 401 ? "Token rejected" : "GitHub error " + res.status);
+    const batch = await res.json();
+    all = all.concat(batch);
+    if (batch.length < 100) break;
+  }
+  return all;
+}
+
+// One call gives both the newest commit AND the total count:
+// per_page=1 means the number of the "last" page equals the number of commits.
+async function commitInfo(repo) {
+  const res = await gh(`${API}/repos/${repo.full_name}/commits?per_page=1`);
+  if (res.status === 409 || res.status === 404) return { commit:null, count:0 }; // empty repo
+  if (!res.ok) return { commit:null, count:null };
+  const list = await res.json();
+  const link = res.headers.get("link") || "";
+  const m = link.match(/[?&]page=(\d+)>;\s*rel="last"/);
+  const count = m ? Number(m[1]) : list.length;
+  const c = list[0];
+  return { commit: c ? { msg:c.commit.message.split("\n")[0], url:c.html_url, sha:c.sha.slice(0,7), date:c.commit.author?.date } : null, count };
+}
+
+function pagesUrl(repo) {
+  if (!repo.has_pages) return "";
+  if (repo.homepage && /github\.io/i.test(repo.homepage)) return repo.homepage;
+  const owner = repo.owner.login.toLowerCase();
+  return repo.name.toLowerCase() === owner + ".github.io"
+    ? `https://${owner}.github.io/` : `https://${owner}.github.io/${repo.name}/`;
+}
+
+function ago(iso) {
+  if (!iso) return "";
+  const s = (Date.now() - new Date(iso)) / 1000;
+  const units = [["year",31536000],["month",2592000],["day",86400],["hour",3600],["minute",60]];
+  for (const [n,v] of units) if (s >= v) { const k = Math.floor(s/v); return `${k} ${n}${k>1?"s":""} ago`; }
+  return "just now";
+}
+
+async function load() {
+  const user = $("user").value.trim();
+  if (!user && !$("token").value.trim()) { setStatus("Enter a username.", true); $("settings").open = true; return; }
+  store.set("gh-user", user); store.set("gh-token", $("token").value.trim());
+  $("settings").open = false;   // tuck the entry card away once we have what we need
+  $("go").disabled = true; setStatus("Fetching repositories…");
+  try {
+    const repos = await listRepos(user);
+    rows = repos.map(r => ({
+      name:r.name, url:r.html_url, desc:r.description || "", lang:r.language || "",
+      vis:r.private ? "private" : "public", pushed:r.pushed_at, pages:pagesUrl(r),
+      commit:null, count:null, _repo:r,
+    }));
+    render();
+    // Fetch commit info with limited concurrency.
+    let done = 0, i = 0;
+    const worker = async () => {
+      while (i < rows.length) {
+        const row = rows[i++];
+        try { Object.assign(row, await commitInfo(row._repo)); } catch (e) { row.count = null; }
+        setStatus(`Loading commit details… ${++done}/${rows.length}`);
+        render();
+      }
+    };
+    await Promise.all(Array.from({length:6}, worker));
+    setStatus(`${rows.length} repositories.`);
+  } catch (e) {
+    setStatus(e.message, true);
+    $("settings").open = true;
+  } finally { $("go").disabled = false; }
+}
+
+function setStatus(msg, err) { const s=$("status"); s.textContent = msg; s.className = "status" + (err ? " err" : ""); }
+
+function render() {
+  const f = $("filter").value.trim().toLowerCase();
+  const key = $("sort").value;
+  const dir = (key === "name" || key === "lang") ? 1 : -1;   // text A→Z, numbers/dates newest first
+  const val = r => key === "commit" ? (r.commit?.date || "") : (r[key] ?? "");
+  const shown = rows
+    .filter(r => !f || (r.name+" "+r.lang+" "+r.desc).toLowerCase().includes(f))
+    .sort((a,b) => {
+      const x = val(a), y = val(b);
+      return (typeof x === "number" && typeof y === "number" ? x-y : String(x).localeCompare(String(y), undefined, {numeric:true})) * dir;
+    });
+  const dash = '<span class="dim">—</span>';
+  $("grid").innerHTML = shown.map(r => `<article class="card">
+    <header>
+      <a class="name" href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.name)}</a>
+      <span class="badge ${r.vis}">${r.vis}</span>
+    </header>
+    <p class="desc">${r.desc ? esc(r.desc) : "No description"}</p>
+    <dl class="meta">
+      <dt>Language</dt><dd>${r.lang ? esc(r.lang) : dash}</dd>
+      <dt>Commits</dt><dd>${r.count ?? '<span class="dim">…</span>'}</dd>
+      <dt>Last push</dt><dd title="${esc(r.pushed)}">${ago(r.pushed)}</dd>
+      <dt>Latest</dt><dd>${r.commit
+        ? `<div class="msg" title="${esc(r.commit.msg)}"><a href="${esc(r.commit.url)}" target="_blank" rel="noopener">${esc(r.commit.sha)}</a> ${esc(r.commit.msg)}</div><small>${ago(r.commit.date)}</small>`
+        : (r.count === 0 ? '<span class="dim">no commits</span>' : '<span class="dim">…</span>')}</dd>
+    </dl>
+    <footer>${r.pages ? `<a href="${esc(r.pages)}" target="_blank" rel="noopener">GitHub Pages ↗</a>` : '<span class="dim">No Pages site</span>'}</footer>
+  </article>`).join("");
+}
+
+$("filter").addEventListener("input", render);
+$("sort").addEventListener("change", render);
+$("go").addEventListener("click", load);
+["user","token"].forEach(id => $(id).addEventListener("keydown", e => e.key==="Enter" && load()));
+
+$("user").value = store.get("gh-user"); $("token").value = store.get("gh-token");
+render();
+if ($("user").value) load(); else $("settings").open = true;   // first visit: show the entry card
+</script>
+</body>
+</html>
